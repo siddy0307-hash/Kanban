@@ -1,0 +1,8 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kanban-frontend:local
+    ports:
+      - "3001:80"
