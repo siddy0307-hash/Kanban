@@ -4,13 +4,7 @@ pipeline {
     environment {
         PATH = "/usr/local/bin:/opt/homebrew/bin:${env.PATH}"
         CI = "true"
-        PUBLIC_URL = "/Kanban"
         GHCR_IMAGE = "ghcr.io/siddy0307-hash/kanban-frontend"
-    }
-
-    triggers {
-        // Jenkins checks GitHub approximately every two minutes.
-        pollSCM('H/2 * * * *')
     }
 
     options {
@@ -18,18 +12,31 @@ pipeline {
         timestamps()
         disableConcurrentBuilds(abortPrevious: true)
         buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 20, unit: 'MINUTES')
     }
 
     stages {
-         stage('Checkout Code') {
+        stage('Checkout Code') {
             steps {
                 checkout scm
             }
         }
-        stage('Checkout Code') {
+
+        stage('Prepare Build Information') {
             steps {
-                git branch: 'main',
-                    url: 'https://github.com/siddy0307-hash/Kanban.git'
+                script {
+                    env.IMAGE_TAG = sh(
+                        script: 'git rev-parse --short=12 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Branch: ${env.BRANCH_NAME}"
+                    echo "Commit: ${env.IMAGE_TAG}"
+
+                    if (env.CHANGE_ID) {
+                        echo "Pull Request: ${env.CHANGE_ID}"
+                    }
+                }
             }
         }
 
@@ -41,6 +48,12 @@ pipeline {
 
                     echo "npm version:"
                     npm --version
+
+                    echo "Docker version:"
+                    docker --version
+
+                    echo "kubectl version:"
+                    kubectl version --client
                 '''
             }
         }
@@ -67,8 +80,20 @@ pipeline {
             steps {
                 sh '''
                     test -s build/index.html
-                    test -n "$(find build/static/js -name 'main.*.js' -print -quit)"
-                    test -n "$(find build/static/css -name 'main.*.css' -print -quit)"
+
+                    test -n "$(
+                        find build/static/js \
+                            -name 'main.*.js' \
+                            -print \
+                            -quit
+                    )"
+
+                    test -n "$(
+                        find build/static/css \
+                            -name 'main.*.css' \
+                            -print \
+                            -quit
+                    )"
 
                     echo "Production build verified successfully."
                     du -sh build
@@ -81,152 +106,117 @@ pipeline {
                 )
             }
         }
-        
-        stage('Verify Docker') {
-    steps {
-        sh '''
-            docker --version
-            docker compose version
-        '''
-    }
-}
 
-stage('Build Docker Image') {
-    steps {
-        script {
-            env.IMAGE_TAG = sh(
-                script: 'git rev-parse --short HEAD',
-                returnStdout: true
-            ).trim()
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    docker build \
+                        --label org.opencontainers.image.source=https://github.com/siddy0307-hash/Kanban \
+                        --tag "$GHCR_IMAGE:$IMAGE_TAG" \
+                        .
+                '''
+            }
         }
 
-        sh '''
-            docker build \
-                --label org.opencontainers.image.source=https://github.com/siddy0307-hash/Kanban \
-                --tag "$GHCR_IMAGE:$IMAGE_TAG" \
-                --tag "$GHCR_IMAGE:latest" \
-                .
-        '''
-    }
-}
+        stage('Push Docker Image to GHCR') {
+            when {
+                branch 'main'
+            }
 
-stage('Push Docker Image to GHCR') {
-    steps {
-        withCredentials([
-            usernamePassword(
-                credentialsId: 'github-container-registry',
-                usernameVariable: 'GHCR_USERNAME',
-                passwordVariable: 'GHCR_TOKEN'
-            )
-        ]) {
-            sh '''
-                trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
-
-                printf '%s' "$GHCR_TOKEN" |
-                    docker login ghcr.io \
-                        --username "$GHCR_USERNAME" \
-                        --password-stdin
-
-                docker push "$GHCR_IMAGE:$IMAGE_TAG"
-                docker push "$GHCR_IMAGE:latest"
-            '''
-        }
-    }
-}
-
-stage('Deploy to Kubernetes') {
-    steps {
-        sh '''
-            kubectl --context docker-desktop set image \
-                deployment/kanban-frontend \
-                frontend="$GHCR_IMAGE:$IMAGE_TAG"
-
-            kubectl --context docker-desktop rollout status \
-                deployment/kanban-frontend \
-                --timeout=120s
-        '''
-    }
-}
-
-stage('Deploy Docker Container') {
-    steps {
-        sh '''
-            docker compose -p kanban-board up \
-                -d \
-                --no-build \
-                --force-recreate \
-                frontend
-        '''
-    }
-}
-
-stage('Verify Docker Deployment') {
-    steps {
-        sh '''
-            SUCCESS=false
-
-            for ATTEMPT in 1 2 3 4 5 6 7 8 9 10
-            do
-                if curl --fail --silent http://localhost:3001/health
-                then
-                    SUCCESS=true
-                    break
-                fi
-
-                sleep 2
-            done
-
-            if [ "$SUCCESS" != "true" ]
-            then
-                docker compose -p kanban-board logs frontend
-                exit 1
-            fi
-
-            echo "Docker deployment is healthy."
-            docker compose -p kanban-board ps
-        '''
-    }
-}
-
-        stage('Deploy to GitHub Pages') {
             steps {
                 withCredentials([
-                    gitUsernamePassword(
-                        credentialsId: '1551179d-6bfb-4088-8aa1-85c56d97ce4f',
-                        gitToolName: 'Default'
+                    usernamePassword(
+                        credentialsId: 'github-container-registry',
+                        usernameVariable: 'GHCR_USERNAME',
+                        passwordVariable: 'GHCR_TOKEN'
                     )
                 ]) {
                     sh '''
-                        DEPLOY_DIR="$(mktemp -d)"
-                        trap 'rm -rf "$DEPLOY_DIR"' EXIT
+                        trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
 
-                        cp -R build/. "$DEPLOY_DIR/"
-                        touch "$DEPLOY_DIR/.nojekyll"
+                        printf '%s' "$GHCR_TOKEN" |
+                            docker login ghcr.io \
+                                --username "$GHCR_USERNAME" \
+                                --password-stdin
 
-                        cd "$DEPLOY_DIR"
+                        docker tag \
+                            "$GHCR_IMAGE:$IMAGE_TAG" \
+                            "$GHCR_IMAGE:latest"
 
-                        git init
-                        git checkout -b gh-pages
-                        git config user.name "Jenkins"
-                        git config user.email "jenkins@localhost"
-
-                        git add .
-                        git commit -m "Deploy Jenkins build ${BUILD_NUMBER}"
-
-                        git remote add origin https://github.com/siddy0307-hash/Kanban.git
-                        git push --force origin gh-pages
+                        docker push "$GHCR_IMAGE:$IMAGE_TAG"
+                        docker push "$GHCR_IMAGE:latest"
                     '''
                 }
             }
         }
-    } 
+
+        stage('Deploy to Kubernetes') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh '''
+                    kubectl --context docker-desktop set image \
+                        deployment/kanban-frontend \
+                        frontend="$GHCR_IMAGE:$IMAGE_TAG"
+
+                    kubectl --context docker-desktop rollout status \
+                        deployment/kanban-frontend \
+                        --timeout=120s
+                '''
+            }
+        }
+
+        stage('Verify Kubernetes Deployment') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh '''
+                    EXPECTED_IMAGE="$GHCR_IMAGE:$IMAGE_TAG"
+
+                    ACTUAL_IMAGE="$(
+                        kubectl --context docker-desktop \
+                            get deployment kanban-frontend \
+                            -o jsonpath='{.spec.template.spec.containers[?(@.name=="frontend")].image}'
+                    )"
+
+                    echo "Expected image: $EXPECTED_IMAGE"
+                    echo "Deployed image: $ACTUAL_IMAGE"
+
+                    test "$ACTUAL_IMAGE" = "$EXPECTED_IMAGE"
+
+                    kubectl --context docker-desktop \
+                        get deployment kanban-frontend
+
+                    kubectl --context docker-desktop \
+                        get pods \
+                        -l app=kanban-frontend
+
+                    echo "Kubernetes deployment verified successfully."
+                '''
+            }
+        }
+    }
 
     post {
         success {
-            echo 'CI/CD pipeline completed successfully.'
-            echo 'Build artifacts are available in Jenkins.'
-            echo 'Application deployed to GitHub Pages.'
-            echo 'URL: https://siddy0307-hash.github.io/Kanban/'
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    echo 'Main pipeline completed successfully.'
+                    echo 'Docker image was pushed to GHCR.'
+                    echo 'Application was deployed to Kubernetes.'
+                    echo "Image: ${env.GHCR_IMAGE}:${env.IMAGE_TAG}"
+                } else if (env.CHANGE_ID) {
+                    echo "Pull request ${env.CHANGE_ID} passed CI."
+                    echo 'No image was pushed and no deployment was performed.'
+                } else {
+                    echo "Branch ${env.BRANCH_NAME} passed CI."
+                    echo 'No image was pushed and no deployment was performed.'
+                }
+            }
         }
 
         failure {
